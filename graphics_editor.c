@@ -1,23 +1,10 @@
 /*
- * ╔══════════════════════════════════════════════════════════╗
- * ║        ASCII 2D GRAPHICS EDITOR  — gfx_canvas.c         ║
- * ║  Shapes: Circle · Rectangle · Line · Triangle           ║
- * ║  Canvas stored as 2-D char array; rendered with * and _ ║
- * ╚══════════════════════════════════════════════════════════╝
+ * canvas_editor.c
  *
- * UNIQUE DESIGN DECISIONS
- * ───────────────────────
- *  • Every shape is stored in an "object registry" (array of
- *    ShapeNode) with a sequential numeric ID, making add /
- *    delete / modify O(n) but easy to audit.
- *  • The canvas is NEVER drawn to during editing — it is
- *    re-rasterised from scratch each time "display" is called
- *    (painter's algorithm, back-to-front by insertion order).
- *  • A tiny REPL loop parses typed commands; no menus, no
- *    ncurses — pure portable C99.
- *  • Bresenham's circle & line algorithms used for accuracy.
- *  • Fill character for shape interiors : '_'
- *    Outline / border character          : '*'
+ * A 2-D text-mode graphics editor built on a scene-graph.
+ * Includes explicit row/column coordinate labeling for ease of plotting.
+ *
+ * Compile:  gcc -Wall -o canvas_editor canvas_editor.c
  */
 
 #include <stdio.h>
@@ -25,372 +12,520 @@
 #include <string.h>
 #include <math.h>
 
-/* ── canvas dimensions ─────────────────────────────────── */
-#define ROWS  25
-#define COLS  60
+/* ── Canvas dimensions ─────────────────────────────────────── */
+#define ROWS   30
+#define COLS   70
 
-/* ── shape-type tags ───────────────────────────────────── */
-typedef enum { SH_CIRCLE = 1, SH_RECT, SH_LINE, SH_TRIANGLE } ShapeKind;
+/* ── Object-type tags ──────────────────────────────────────── */
+typedef enum {
+    OBJ_RECT = 1,
+    OBJ_CIRCLE,
+    OBJ_LINE,
+    OBJ_TRIANGLE
+} ObjKind;
 
-/* ── generic parameter block (union-style flat struct) ─── */
-typedef struct {
-    int id;          /* assigned on insertion, 1-based      */
-    ShapeKind kind;
-    int filled;      /* 1 = fill interior with '_'          */
-    /* circle : cx cy radius                                 */
-    /* rect   : x1 y1 x2 y2                                 */
-    /* line   : x1 y1 x2 y2                                 */
-    /* triangle: x1 y1  x2 y2  x3 y3                        */
-    int p[6];
-} Shape;
+/* ── Per-object parameter bags ─────────────────────────────── */
+typedef struct { int x, y, w, h; }           RectParams;
+typedef struct { int cx, cy, r; }             CircleParams;
+typedef struct { int x1, y1, x2, y2; }        LineParams;
+typedef struct { int x1,y1, x2,y2, x3,y3; }  TriParams;
 
-/* ── registry ──────────────────────────────────────────── */
-#define MAX_SHAPES 64
-static Shape registry[MAX_SHAPES];
-static int   reg_count = 0;
+/* ── Scene-graph node ──────────────────────────────────────── */
+typedef struct SceneNode {
+    int        id;
+    ObjKind    kind;
+    char       ink;          /* character used to draw this object */
+    union {
+        RectParams   rect;
+        CircleParams circle;
+        LineParams   line;
+        TriParams    tri;
+    } p;
+    struct SceneNode *next;
+} SceneNode;
 
-/* ── canvas buffer ─────────────────────────────────────── */
-static char canvas[ROWS][COLS];
+/* ── Global state ──────────────────────────────────────────── */
+static char       canvas[ROWS][COLS];   /* the pixel buffer          */
+static SceneNode *scene_head = NULL;    /* linked list of objects    */
+static int        next_id    = 1;       /* auto-increment object IDs */
 
-/* ══════════════════════════════════════════════════════════
- *  LOW-LEVEL CANVAS HELPERS
- * ══════════════════════════════════════════════════════════ */
+/* ═══════════════════════════════════════════════════════════════
+ * Canvas utilities
+ * ═══════════════════════════════════════════════════════════════ */
 
-static void canvas_clear(void) {
+static void canvas_clear(void)
+{
     for (int r = 0; r < ROWS; r++)
         for (int c = 0; c < COLS; c++)
             canvas[r][c] = ' ';
 }
 
-/* safe pixel setter — silently clips out-of-bounds */
-static void put_pixel(int r, int c, char ch) {
+static void canvas_put(int r, int c, char ink)
+{
     if (r >= 0 && r < ROWS && c >= 0 && c < COLS)
-        canvas[r][c] = ch;
+        canvas[r][c] = ink;
 }
 
-/* ══════════════════════════════════════════════════════════
- *  RASTERISERS  (work directly on the canvas buffer)
- * ══════════════════════════════════════════════════════════ */
-
-/* ── Bresenham line ────────────────────────────────────── */
-static void raster_line(int x1, int y1, int x2, int y2, char ch) {
-    int dx = abs(x2 - x1), dy = abs(y2 - y1);
-    int sx = (x1 < x2) ? 1 : -1;
-    int sy = (y1 < y2) ? 1 : -1;
-    int err = dx - dy;
-    while (1) {
-        put_pixel(y1, x1, ch);
-        if (x1 == x2 && y1 == y2) break;
-        int e2 = 2 * err;
-        if (e2 > -dy) { err -= dy; x1 += sx; }
-        if (e2 <  dx) { err += dx; y1 += sy; }
+void display_canvas(void)
+{
+    printf("\n");
+    
+    /* 1. Column header - Tens digit */
+    printf("     "); /* Alignment spacer for the row index */
+    for (int c = 0; c < COLS; c++) {
+        if (c % 10 == 0) printf("%d", c / 10);
+        else             printf(" ");
     }
-}
+    printf("\n");
 
-/* ── Bresenham circle outline ──────────────────────────── */
-static void circle_outline_points(int cx, int cy, int x, int y) {
-    put_pixel(cy + y, cx + x, '*'); put_pixel(cy - y, cx + x, '*');
-    put_pixel(cy + y, cx - x, '*'); put_pixel(cy - y, cx - x, '*');
-    put_pixel(cy + x, cx + y, '*'); put_pixel(cy - x, cx + y, '*');
-    put_pixel(cy + x, cx - y, '*'); put_pixel(cy - x, cx - y, '*');
-}
+    /* 2. Column header - Ones digit */
+    printf("     ");
+    for (int c = 0; c < COLS; c++) {
+        printf("%d", c % 10);
+    }
+    printf("\n");
 
-static void raster_circle(int cx, int cy, int r, int filled) {
-    if (filled) {
-        /* horizontal scanlines inside circle */
-        for (int row = cy - r; row <= cy + r; row++) {
-            int dy  = row - cy;
-            int len = (int)sqrt((double)(r * r - dy * dy));
-            for (int col = cx - len; col <= cx + len; col++)
-                put_pixel(row, col, '_');
+    /* 3. Top Canvas Border */
+    printf("    +");
+    for (int c = 0; c < COLS; c++) putchar('-');
+    puts("+");
+
+    /* 4. Canvas Rows with Index Labels */
+    for (int r = 0; r < ROWS; r++) {
+        printf("%2d  |", r); /* Left-aligned row indices */
+        for (int c = 0; c < COLS; c++) {
+            putchar(canvas[r][c]);
         }
+        printf("|\n");
     }
-    /* always draw outline on top */
-    int x = 0, y = r, d = 3 - 2 * r;
+
+    /* 5. Bottom Canvas Border */
+    printf("    +");
+    for (int c = 0; c < COLS; c++) putchar('-');
+    puts("+\n");
+}
+
+/* ═══════════════════════════════════════════════════════════════
+ * Drawing primitives
+ * ═══════════════════════════════════════════════════════════════ */
+
+void draw_rect(int x, int y, int w, int h, char ink)
+{
+    for (int c = x; c < x + w; c++) {
+        canvas_put(y,         c, (c == x || c == x+w-1) ? ink : '_');
+        canvas_put(y + h - 1, c, (c == x || c == x+w-1) ? ink : '_');
+    }
+    for (int r = y + 1; r < y + h - 1; r++) {
+        canvas_put(r, x,         '|');
+        canvas_put(r, x + w - 1, '|');
+    }
+    canvas_put(y,         x,         ink);
+    canvas_put(y,         x + w - 1, ink);
+    canvas_put(y + h - 1, x,         ink);
+    canvas_put(y + h - 1, x + w - 1, ink);
+}
+
+void draw_circle(int cx, int cy, int r, char ink)
+{
+    int x = 0, y = r, d = 1 - r;
     while (x <= y) {
-        circle_outline_points(cx, cy, x, y);
-        if (d < 0) d += 4 * x + 6;
-        else { d += 4 * (x - y) + 10; y--; }
+        canvas_put(cy + y, cx + x, ink);
+        canvas_put(cy + y, cx - x, ink);
+        canvas_put(cy - y, cx + x, ink);
+        canvas_put(cy - y, cx - x, ink);
+        canvas_put(cy + x, cx + y, ink);
+        canvas_put(cy + x, cx - y, ink);
+        canvas_put(cy - x, cx + y, ink);
+        canvas_put(cy - x, cx - y, ink);
+        if (d < 0) {
+            d += 2 * x + 3;
+        } else {
+            d += 2 * (x - y) + 5;
+            y--;
+        }
         x++;
     }
 }
 
-/* ── rectangle ─────────────────────────────────────────── */
-static void raster_rect(int x1, int y1, int x2, int y2, int filled) {
-    /* normalise */
-    if (x1 > x2) { int t = x1; x1 = x2; x2 = t; }
-    if (y1 > y2) { int t = y1; y1 = y2; y2 = t; }
-    if (filled)
-        for (int r = y1 + 1; r < y2; r++)
-            for (int c = x1 + 1; c < x2; c++)
-                put_pixel(r, c, '_');
-    /* borders */
-    raster_line(x1, y1, x2, y1, '*');
-    raster_line(x1, y2, x2, y2, '*');
-    raster_line(x1, y1, x1, y2, '*');
-    raster_line(x2, y1, x2, y2, '*');
-}
-
-/* ── triangle ──────────────────────────────────────────── */
-static void raster_triangle(int x1,int y1, int x2,int y2,
-                             int x3,int y3, int filled) {
-    if (filled) {
-        /* scanline fill using edge sorting */
-        int minY = y1, maxY = y1;
-        if (y2 < minY) minY = y2; if (y2 > maxY) maxY = y2;
-        if (y3 < minY) minY = y3; if (y3 > maxY) maxY = y3;
-        for (int row = minY; row <= maxY; row++) {
-            /* find intersections with the three edges */
-            int xs[3]; int nx = 0;
-            /* helper lambda via macro */
-#define EDGE_X(ax,ay,bx,by) \
-    if ((ay<=row&&row<by)||(by<=row&&row<ay)) { \
-        xs[nx++]=(ax)+(int)(((double)((row)-(ay))/((by)-(ay)))*((bx)-(ax))); }
-            EDGE_X(x1,y1,x2,y2)
-            EDGE_X(x2,y2,x3,y3)
-            EDGE_X(x3,y3,x1,y1)
-#undef EDGE_X
-            if (nx >= 2) {
-                int lo = xs[0], hi = xs[1];
-                if (lo > hi) { int t=lo; lo=hi; hi=t; }
-                for (int c = lo; c <= hi; c++) put_pixel(row, c, '_');
-            }
-        }
-    }
-    raster_line(x1,y1,x2,y2,'*');
-    raster_line(x2,y2,x3,y3,'*');
-    raster_line(x3,y3,x1,y1,'*');
-}
-
-/* ══════════════════════════════════════════════════════════
- *  DISPATCH: rasterise one Shape onto the canvas
- * ══════════════════════════════════════════════════════════ */
-static void render_shape(const Shape *s) {
-    switch (s->kind) {
-    case SH_CIRCLE:
-        raster_circle(s->p[0], s->p[1], s->p[2], s->filled);
-        break;
-    case SH_RECT:
-        raster_rect(s->p[0], s->p[1], s->p[2], s->p[3], s->filled);
-        break;
-    case SH_LINE:
-        raster_line(s->p[0], s->p[1], s->p[2], s->p[3], '*');
-        break;
-    case SH_TRIANGLE:
-        raster_triangle(s->p[0],s->p[1],s->p[2],s->p[3],
-                        s->p[4],s->p[5], s->filled);
-        break;
-    }
-}
-
-/* ══════════════════════════════════════════════════════════
- *  REGISTRY: add / delete / modify
- * ══════════════════════════════════════════════════════════ */
-
-/* returns pointer to new slot or NULL if full */
-static Shape *reg_add(ShapeKind k, int filled, int params[]) {
-    if (reg_count >= MAX_SHAPES) { puts("Registry full!"); return NULL; }
-    Shape *s = &registry[reg_count++];
-    s->id     = reg_count;           /* 1-based sequential ID */
-    s->kind   = k;
-    s->filled = filled;
-    memcpy(s->p, params, sizeof(s->p));
-    printf("  Added shape ID %d\n", s->id);
-    return s;
-}
-
-/* delete by ID — fills gap by shifting tail down */
-static int reg_delete(int id) {
-    for (int i = 0; i < reg_count; i++) {
-        if (registry[i].id == id) {
-            memmove(&registry[i], &registry[i+1],
-                    sizeof(Shape) * (reg_count - i - 1));
-            reg_count--;
-            printf("  Deleted shape ID %d\n", id);
-            return 1;
-        }
-    }
-    printf("  Shape ID %d not found.\n", id);
-    return 0;
-}
-
-/* modify: find by ID, keep kind, replace params */
-static int reg_modify(int id, int filled, int params[]) {
-    for (int i = 0; i < reg_count; i++) {
-        if (registry[i].id == id) {
-            registry[i].filled = filled;
-            memcpy(registry[i].p, params, sizeof(registry[i].p));
-            printf("  Modified shape ID %d\n", id);
-            return 1;
-        }
-    }
-    printf("  Shape ID %d not found.\n", id);
-    return 0;
-}
-
-/* ══════════════════════════════════════════════════════════
- *  DISPLAY  — re-rasterises from registry each call
- * ══════════════════════════════════════════════════════════ */
-static void display_canvas(void) {
-    canvas_clear();
-    for (int i = 0; i < reg_count; i++)
-        render_shape(&registry[i]);
-
-    /* top border */
-    putchar('+');
-    for (int c = 0; c < COLS; c++) putchar('-');
-    puts("+");
-
-    for (int r = 0; r < ROWS; r++) {
-        putchar('|');
-        for (int c = 0; c < COLS; c++) putchar(canvas[r][c]);
-        puts("|");
-    }
-
-    /* bottom border */
-    putchar('+');
-    for (int c = 0; c < COLS; c++) putchar('-');
-    puts("+");
-    printf("  Shapes in registry: %d\n", reg_count);
-}
-
-/* ══════════════════════════════════════════════════════════
- *  LIST registry contents
- * ══════════════════════════════════════════════════════════ */
-static const char *kind_name(ShapeKind k) {
-    switch (k) {
-    case SH_CIRCLE:   return "circle";
-    case SH_RECT:     return "rect";
-    case SH_LINE:     return "line";
-    case SH_TRIANGLE: return "triangle";
-    default:          return "?";
-    }
-}
-
-static void list_shapes(void) {
-    if (reg_count == 0) { puts("  No shapes."); return; }
-    for (int i = 0; i < reg_count; i++) {
-        Shape *s = &registry[i];
-        printf("  [%d] %-8s filled=%d  params=(%d %d %d %d %d %d)\n",
-               s->id, kind_name(s->kind), s->filled,
-               s->p[0],s->p[1],s->p[2],s->p[3],s->p[4],s->p[5]);
-    }
-}
-
-/* ══════════════════════════════════════════════════════════
- *  HELP
- * ══════════════════════════════════════════════════════════ */
-static void print_help(void) {
-    puts("\n  ── Commands ──────────────────────────────────────────");
-    puts("  circle  cx cy r  [fill]         add a circle");
-    puts("  rect    x1 y1 x2 y2 [fill]      add a rectangle");
-    puts("  line    x1 y1 x2 y2             add a line");
-    puts("  tri     x1 y1 x2 y2 x3 y3 [fill] add a triangle");
-    puts("  del     id                      delete a shape");
-    puts("  mod     id [fill] p0..p5        modify a shape");
-    puts("  list                            show registry");
-    puts("  show                            render & display");
-    puts("  demo                            load demo scene");
-    puts("  clear                           clear registry");
-    puts("  help                            this message");
-    puts("  quit                            exit");
-    puts("  (fill = 1 for filled, 0 for outline only)");
-    puts("  ──────────────────────────────────────────────────────\n");
-}
-
-/* ══════════════════════════════════════════════════════════
- *  DEMO SCENE
- * ══════════════════════════════════════════════════════════ */
-static void load_demo(void) {
-    reg_count = 0;
-    int p[6];
-
-    /* filled circle centre */
-    p[0]=29; p[1]=12; p[2]=5;  memset(p+3,0,12); reg_add(SH_CIRCLE,  1, p);
-    /* outline rectangle frame */
-    p[0]=2;  p[1]=2;  p[2]=57; p[3]=22; memset(p+4,0,8); reg_add(SH_RECT, 0, p);
-    /* diagonal line */
-    p[0]=2;  p[1]=2;  p[2]=57; p[3]=22; reg_add(SH_LINE, 0, p);
-    /* filled triangle */
-    p[0]=5;  p[1]=20; p[2]=15; p[3]=5; p[4]=25; p[5]=20; reg_add(SH_TRIANGLE, 1, p);
-    /* small outline circle */
-    p[0]=48; p[1]=6;  p[2]=4;  memset(p+3,0,12); reg_add(SH_CIRCLE, 0, p);
-
-    puts("  Demo scene loaded (5 shapes). Type 'show' to display.");
-}
-
-/* ══════════════════════════════════════════════════════════
- *  REPL  (Read-Eval-Print Loop)
- * ══════════════════════════════════════════════════════════ */
-int main(void) {
-    char line[256];
-    int  p[6];
-    int  fill, id;
-
-    puts("\n  ╔══════════════════════════════════════╗");
-    puts("  ║  ASCII 2-D GRAPHICS EDITOR  v1.0    ║");
-    puts("  ║  Symbols: outline=*  fill=_         ║");
-    puts("  ╚══════════════════════════════════════╝");
-    puts("  Type 'help' for commands, 'demo' to see a sample scene.\n");
+void draw_line(int x1, int y1, int x2, int y2, char ink)
+{
+    int dx  = abs(x2 - x1), dy  = abs(y2 - y1);
+    int sx  = (x1 < x2) ? 1 : -1;
+    int sy  = (y1 < y2) ? 1 : -1;
+    int err = dx - dy;
+    int x   = x1, y = y1;
 
     while (1) {
-        printf("gfx> ");
-        fflush(stdout);
+        char ch = ink;
+        if (ink == '*') {
+            if (dx == 0)             ch = '|';
+            else if (dy == 0)        ch = '_';
+            else if (sx == sy)       ch = '\\';
+            else                     ch = '/';
+        }
+        canvas_put(y, x, ch);
+        if (x == x2 && y == y2) break;
+        int e2 = 2 * err;
+        if (e2 > -dy) { err -= dy; x += sx; }
+        if (e2 <  dx) { err += dx; y += sy; }
+    }
+}
 
-        if (!fgets(line, sizeof(line), stdin)) break;
-        /* strip newline */
-        line[strcspn(line, "\n")] = '\0';
+void draw_triangle(int x1, int y1, int x2, int y2, int x3, int y3, char ink)
+{
+    draw_line(x1, y1, x2, y2, ink);
+    draw_line(x2, y2, x3, y3, ink);
+    draw_line(x3, y3, x1, y1, ink);
+}
 
-        /* ── tokenise first word ── */
-        char cmd[32] = {0};
-        sscanf(line, "%31s", cmd);
+/* ═══════════════════════════════════════════════════════════════
+ * Scene-graph operations
+ * ═══════════════════════════════════════════════════════════════ */
 
-        if      (strcmp(cmd,"quit")==0 || strcmp(cmd,"q")==0) break;
-        else if (strcmp(cmd,"help")==0)  print_help();
-        else if (strcmp(cmd,"show")==0)  display_canvas();
-        else if (strcmp(cmd,"list")==0)  list_shapes();
-        else if (strcmp(cmd,"demo")==0)  load_demo();
-        else if (strcmp(cmd,"clear")==0){ reg_count=0; puts("  Registry cleared."); }
+static void scene_render(void)
+{
+    canvas_clear();
+    for (SceneNode *n = scene_head; n; n = n->next) {
+        switch (n->kind) {
+        case OBJ_RECT:
+            draw_rect(n->p.rect.x, n->p.rect.y, n->p.rect.w, n->p.rect.h, n->ink);
+            break;
+        case OBJ_CIRCLE:
+            draw_circle(n->p.circle.cx, n->p.circle.cy, n->p.circle.r,  n->ink);
+            break;
+        case OBJ_LINE:
+            draw_line(n->p.line.x1, n->p.line.y1, n->p.line.x2, n->p.line.y2, n->ink);
+            break;
+        case OBJ_TRIANGLE:
+            draw_triangle(n->p.tri.x1, n->p.tri.y1, n->p.tri.x2, n->p.tri.y2, n->p.tri.x3, n->p.tri.y3, n->ink);
+            break;
+        }
+    }
+}
 
-        else if (strcmp(cmd,"circle")==0) {
-            memset(p,0,sizeof(p));
-            fill=0;
-            sscanf(line,"%*s %d %d %d %d",&p[0],&p[1],&p[2],&fill);
-            reg_add(SH_CIRCLE, fill, p);
+static void scene_append(SceneNode *node)
+{
+    node->id   = next_id++;
+    node->next = NULL;
+    if (!scene_head) { scene_head = node; return; }
+    SceneNode *t = scene_head;
+    while (t->next) t = t->next;
+    t->next = node;
+}
+
+int scene_add_rect(int x, int y, int w, int h, char ink)
+{
+    SceneNode *n = malloc(sizeof *n);
+    if (!n) return -1;
+    n->kind   = OBJ_RECT;
+    n->ink    = ink;
+    n->p.rect = (RectParams){ x, y, w, h };
+    scene_append(n);
+    return n->id;
+}
+
+int scene_add_circle(int cx, int cy, int r, char ink)
+{
+    SceneNode *n = malloc(sizeof *n);
+    if (!n) return -1;
+    n->kind     = OBJ_CIRCLE;
+    n->ink      = ink;
+    n->p.circle = (CircleParams){ cx, cy, r };
+    scene_append(n);
+    return n->id;
+}
+
+int scene_add_line(int x1, int y1, int x2, int y2, char ink)
+{
+    SceneNode *n = malloc(sizeof *n);
+    if (!n) return -1;
+    n->kind   = OBJ_LINE;
+    n->ink    = ink;
+    n->p.line = (LineParams){ x1, y1, x2, y2 };
+    scene_append(n);
+    return n->id;
+}
+
+int scene_add_triangle(int x1, int y1, int x2, int y2, int x3, int y3, char ink)
+{
+    SceneNode *n = malloc(sizeof *n);
+    if (!n) return -1;
+    n->kind  = OBJ_TRIANGLE;
+    n->ink   = ink;
+    n->p.tri = (TriParams){ x1, y1, x2, y2, x3, y3 };
+    scene_append(n);
+    return n->id;
+}
+
+static SceneNode *scene_find(int id)
+{
+    for (SceneNode *n = scene_head; n; n = n->next)
+        if (n->id == id) return n;
+    return NULL;
+}
+
+int scene_delete(int id)
+{
+    SceneNode *prev = NULL, *cur = scene_head;
+    while (cur) {
+        if (cur->id == id) {
+            if (prev) prev->next = cur->next;
+            else       scene_head = cur->next;
+            free(cur);
+            return 0;
         }
-        else if (strcmp(cmd,"rect")==0) {
-            memset(p,0,sizeof(p));
-            fill=0;
-            sscanf(line,"%*s %d %d %d %d %d",&p[0],&p[1],&p[2],&p[3],&fill);
-            reg_add(SH_RECT, fill, p);
+        prev = cur;
+        cur  = cur->next;
+    }
+    return -1;
+}
+
+int scene_modify_rect(int id, int x, int y, int w, int h, char ink)
+{
+    SceneNode *n = scene_find(id);
+    if (!n || n->kind != OBJ_RECT) return -1;
+    n->ink    = ink;
+    n->p.rect = (RectParams){ x, y, w, h };
+    return 0;
+}
+
+int scene_modify_circle(int id, int cx, int cy, int r, char ink)
+{
+    SceneNode *n = scene_find(id);
+    if (!n || n->kind != OBJ_CIRCLE) return -1;
+    n->ink      = ink;
+    n->p.circle = (CircleParams){ cx, cy, r };
+    return 0;
+}
+
+int scene_modify_line(int id, int x1, int y1, int x2, int y2, char ink)
+{
+    SceneNode *n = scene_find(id);
+    if (!n || n->kind != OBJ_LINE) return -1;
+    n->ink   = ink;
+    n->p.line = (LineParams){ x1, y1, x2, y2 };
+    return 0;
+}
+
+int scene_modify_triangle(int id, int x1, int y1, int x2, int y2, int x3, int y3, char ink)
+{
+    SceneNode *n = scene_find(id);
+    if (!n || n->kind != OBJ_TRIANGLE) return -1;
+    n->ink   = ink;
+    n->p.tri = (TriParams){ x1, y1, x2, y2, x3, y3 };
+    return 0;
+}
+
+void scene_list(void)
+{
+    if (!scene_head) { puts("  (scene is empty)"); return; }
+    for (SceneNode *n = scene_head; n; n = n->next) {
+        printf("  [%d] ink='%c' ", n->id, n->ink);
+        switch (n->kind) {
+        case OBJ_RECT:
+            printf("RECT     x=%d y=%d w=%d h=%d", n->p.rect.x, n->p.rect.y, n->p.rect.w, n->p.rect.h);
+            break;
+        case OBJ_CIRCLE:
+            printf("CIRCLE   cx=%d cy=%d r=%d", n->p.circle.cx, n->p.circle.cy, n->p.circle.r);
+            break;
+        case OBJ_LINE:
+            printf("LINE     (%d,%d)->(%d,%d)", n->p.line.x1, n->p.line.y1, n->p.line.x2, n->p.line.y2);
+            break;
+        case OBJ_TRIANGLE:
+            printf("TRIANGLE (%d,%d) (%d,%d) (%d,%d)", n->p.tri.x1, n->p.tri.y1, n->p.tri.x2, n->p.tri.y2, n->p.tri.x3, n->p.tri.y3);
+            break;
         }
-        else if (strcmp(cmd,"line")==0) {
-            memset(p,0,sizeof(p));
-            sscanf(line,"%*s %d %d %d %d",&p[0],&p[1],&p[2],&p[3]);
-            reg_add(SH_LINE, 0, p);
-        }
-        else if (strcmp(cmd,"tri")==0) {
-            memset(p,0,sizeof(p));
-            fill=0;
-            sscanf(line,"%*s %d %d %d %d %d %d %d",
-                   &p[0],&p[1],&p[2],&p[3],&p[4],&p[5],&fill);
-            reg_add(SH_TRIANGLE, fill, p);
-        }
-        else if (strcmp(cmd,"del")==0) {
-            id=0; sscanf(line,"%*s %d",&id);
-            reg_delete(id);
-        }
-        else if (strcmp(cmd,"mod")==0) {
-            id=0; fill=0; memset(p,0,sizeof(p));
-            sscanf(line,"%*s %d %d %d %d %d %d %d %d",
-                   &id,&fill,&p[0],&p[1],&p[2],&p[3],&p[4],&p[5]);
-            reg_modify(id, fill, p);
-        }
-        else if (strlen(cmd) > 0) {
-            printf("  Unknown command '%s'. Type 'help'.\n", cmd);
+        putchar('\n');
+    }
+}
+
+static void scene_free(void)
+{
+    SceneNode *cur = scene_head;
+    while (cur) {
+        SceneNode *tmp = cur->next;
+        free(cur);
+        cur = tmp;
+    }
+    scene_head = NULL;
+}
+
+/* ═══════════════════════════════════════════════════════════════
+ * Interactive menu
+ * ═══════════════════════════════════════════════════════════════ */
+
+static void print_menu(void)
+{
+    puts("\n+------------------------------+");
+    puts("|   2-D Canvas Editor          |");
+    puts("+------------------------------+");
+    puts("|  1. Add rectangle            |");
+    puts("|  2. Add circle               |");
+    puts("|  3. Add line                 |");
+    puts("|  4. Add triangle             |");
+    puts("|  5. Delete object            |");
+    puts("|  6. Modify object            |");
+    puts("|  7. Display canvas           |");
+    puts("|  8. List objects             |");
+    puts("|  9. Clear all                |");
+    puts("|  0. Quit                     |");
+    puts("+------------------------------+");
+    printf("Choice: ");
+}
+
+static int read_int(const char *prompt)
+{
+    int v; char buf[64];
+    printf("%s", prompt);
+    fflush(stdout);
+    if (!fgets(buf, sizeof buf, stdin)) return 0;
+    if (sscanf(buf, "%d", &v) != 1)    return 0;
+    return v;
+}
+
+static char read_char(const char *prompt)
+{
+    char buf[16];
+    printf("%s", prompt);
+    fflush(stdout);
+    if (!fgets(buf, sizeof buf, stdin)) return '*';
+    return (buf[0] == '\n') ? '*' : buf[0];
+}
+
+static void menu_add_rect(void)
+{
+    int  x = read_int("  x (col): ");
+    int  y = read_int("  y (row): ");
+    int  w = read_int("  width  : ");
+    int  h = read_int("  height : ");
+    char k = read_char("  ink [* _ |]: ");
+    int id  = scene_add_rect(x, y, w, h, k);
+    printf("  -> Rectangle added with ID %d\n", id);
+}
+
+static void menu_add_circle(void)
+{
+    int  cx = read_int("  centre col : ");
+    int  cy = read_int("  centre row : ");
+    int  r  = read_int("  radius     : ");
+    char k  = read_char("  ink [*]: ");
+    int  id = scene_add_circle(cx, cy, r, k);
+    printf("  -> Circle added with ID %d\n", id);
+}
+
+static void menu_add_line(void)
+{
+    int  x1 = read_int("  start col: ");
+    int  y1 = read_int("  start row: ");
+    int  x2 = read_int("  end   col: ");
+    int  y2 = read_int("  end   row: ");
+    char k  = read_char("  ink [*]: ");
+    int  id = scene_add_line(x1, y1, x2, y2, k);
+    printf("  -> Line added with ID %d\n", id);
+}
+
+static void menu_add_triangle(void)
+{
+    int  x1 = read_int("  vertex 1 col: ");
+    int  y1 = read_int("  vertex 1 row: ");
+    int  x2 = read_int("  vertex 2 col: ");
+    int  y2 = read_int("  vertex 2 row: ");
+    int  x3 = read_int("  vertex 3 col: ");
+    int  y3 = read_int("  vertex 3 row: ");
+    char k  = read_char("  ink [*]: ");
+    int  id = scene_add_triangle(x1, y1, x2, y2, x3, y3, k);
+    printf("  -> Triangle added with ID %d\n", id);
+}
+
+static void menu_delete(void)
+{
+    scene_list();
+    int id = read_int("  ID to delete: ");
+    if (scene_delete(id) == 0)
+        printf("  -> Object %d removed.\n", id);
+    else
+        printf("  -> ID %d not found.\n", id);
+}
+
+static void menu_modify(void)
+{
+    scene_list();
+    int id = read_int("  ID to modify: ");
+    SceneNode *n = scene_find(id);
+    if (!n) { printf("  -> ID %d not found.\n", id); return; }
+
+    puts("  Enter new parameters:");
+    char k;
+    switch (n->kind) {
+    case OBJ_RECT: {
+        int x = read_int("  x: "), y = read_int("  y: ");
+        int w = read_int("  w: "), h = read_int("  h: ");
+        k = read_char("  ink: ");
+        scene_modify_rect(id, x, y, w, h, k);
+        break;
+    }
+    case OBJ_CIRCLE: {
+        int cx = read_int("  cx: "), cy = read_int("  cy: ");
+        int r  = read_int("  r : ");
+        k = read_char("  ink: ");
+        scene_modify_circle(id, cx, cy, r, k);
+        break;
+    }
+    case OBJ_LINE: {
+        int x1 = read_int("  x1: "), y1 = read_int("  y1: ");
+        int x2 = read_int("  x2: "), y2 = read_int("  y2: ");
+        k = read_char("  ink: ");
+        scene_modify_line(id, x1, y1, x2, y2, k);
+        break;
+    }
+    case OBJ_TRIANGLE: {
+        int x1 = read_int("  x1: "), y1 = read_int("  y1: ");
+        int x2 = read_int("  x2: "), y2 = read_int("  y2: ");
+        int x3 = read_int("  x3: "), y3 = read_int("  y3: ");
+        k = read_char("  ink: ");
+        scene_modify_triangle(id, x1, y1, x2, y2, x3, y3, k);
+        break;
+    }
+    }
+    printf("  -> Object %d updated.\n", id);
+}
+
+int main(void)
+{
+    canvas_clear();
+    puts("Welcome to canvas_editor -- use '*' and '_' as your ink.");
+
+    char buf[16];
+    int  running = 1;
+
+    while (running) {
+        print_menu();
+        if (!fgets(buf, sizeof buf, stdin)) break;
+
+        switch (buf[0]) {
+        case '1': menu_add_rect();     break;
+        case '2': menu_add_circle();   break;
+        case '3': menu_add_line();     break;
+        case '4': menu_add_triangle(); break;
+        case '5': menu_delete();       break;
+        case '6': menu_modify();       break;
+        case '7':
+            scene_render();
+            display_canvas();
+            break;
+        case '8': scene_list();        break;
+        case '9':
+            scene_free();
+            canvas_clear();
+            next_id = 1;
+            puts("  -> Canvas cleared.");
+            break;
+        case '0': running = 0;         break;
+        default:  puts("  Unknown option -- try again."); break;
         }
     }
 
-    puts("\n  Goodbye.");
+    scene_free();
+    puts("Goodbye.");
     return 0;
 }
